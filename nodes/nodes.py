@@ -3135,6 +3135,8 @@ class WanImageToVideoSVIPro(io.ComfyNode):
                 io.Latent.Input("anchor_samples"),
                 io.Latent.Input("prev_samples", optional=True),
                 io.Int.Input("motion_latent_count", default=1, min=0, max=128, step=1),
+                io.AnyType.Input("clip_embeds", optional=True,
+                    tooltip="Optional CLIP Vision embeddings for face identity anchoring. Connect WanVideoClipVisionEncode output here."),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -3144,7 +3146,7 @@ class WanImageToVideoSVIPro(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, prev_samples=None) -> io.NodeOutput:
+    def execute(cls, positive, negative, length, motion_latent_count, anchor_samples, prev_samples=None, clip_embeds=None) -> io.NodeOutput:
         anchor_latent = anchor_samples["samples"].clone()
 
         B, C, T, H, W = anchor_latent.shape
@@ -3169,8 +3171,27 @@ class WanImageToVideoSVIPro(io.ComfyNode):
         mask = torch.ones((1, 1, empty_latent.shape[2], H, W), device=device, dtype=dtype)
         mask[:, :, :1] = 0.0
 
-        positive = node_helpers.conditioning_set_values(positive, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
-        negative = node_helpers.conditioning_set_values(negative, {"concat_latent_image": image_cond_latent, "concat_mask": mask})
+        # Extract CLIP Vision face embedding from WanVideoClipVisionEncode output
+        clip_fea = None
+        clip_fea_neg = None
+        if clip_embeds is not None:
+            if isinstance(clip_embeds, dict):
+                clip_fea = clip_embeds.get("clip_embeds", None)
+                clip_fea_neg = clip_embeds.get("negative_clip_embeds", None)
+            else:
+                # Raw tensor input — use directly as clip_fea
+                clip_fea = clip_embeds
+                clip_fea_neg = None
+
+        pos_cond = {"concat_latent_image": image_cond_latent, "concat_mask": mask}
+        neg_cond = {"concat_latent_image": image_cond_latent, "concat_mask": mask}
+
+        if clip_fea is not None:
+            pos_cond["clip_fea"] = clip_fea
+            neg_cond["clip_fea"] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+
+        positive = node_helpers.conditioning_set_values(positive, pos_cond)
+        negative = node_helpers.conditioning_set_values(negative, neg_cond)
 
         out_latent = {}
         out_latent["samples"] = empty_latent
