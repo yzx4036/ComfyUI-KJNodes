@@ -69,7 +69,7 @@ from .nodes.model_optimization_nodes import (
     DiffusionModelLoaderKJ, ModelPatchTorchSettings, PatchModelPatcherOrder,
     TorchCompileModelFluxAdvancedV2, TorchCompileModelWanVideoV2,
     TorchCompileModelAdvanced, TorchCompileVAE, TorchCompileControlNet,
-    WanVideoTeaCacheKJ, WanVideoEnhanceAVideoKJ, LTXVEnhanceAVideoKJ, WanVideoNAG, Krea2PromptWeight,
+    WanVideoTeaCacheKJ, WanVideoEnhanceAVideoKJ, LTXVEnhanceAVideoKJ, WanVideoNAG, Krea2PromptWeight, MossImagePromptWeight,
     SkipLayerGuidanceWanVideo, CFGZeroStarAndInit, GGUFLoaderKJ, NABLA_AttentionKJ,
     StartRecordCUDAMemoryHistory, EndRecordCUDAMemoryHistory, VisualizeCUDAMemoryHistory,
     ModelMemoryUseReportPatch, ModelMemoryUsageFactorOverride, WanChunkFeedForward,
@@ -78,10 +78,13 @@ from .nodes.model_optimization_nodes import (
 from .nodes.lora_nodes import LoraExtractKJ, LoraReduceRank
 from .nodes.image_transform_node import ImageTransformKJ, BBOXToBoundingBoxKJ
 from .nodes.sharpen_nodes import ImageSharpenKJ
+from .nodes.nodes_looping import LOOP_NODES
 from .nodes.hdr_preview_node import HDRPreviewKJ
 from .nodes.preview_override_node import ModelPreviewOverrideKJ, GetPreviewOverrideFramesKJ
 from .nodes.context_windows_visualizer import ContextWindowsVisualizerKJ
 from .nodes.ideogram4_nodes import Ideogram4PromptBuilderKJ
+from .nodes.flux3_nodes import Flux3PromptBuilderKJ, Flux3BoxReconcileKJ
+from .nodes.moss_image_nodes import MossImagePromptBuilderKJ
 
 import logging
 
@@ -190,6 +193,9 @@ NODE_CONFIG = {
     "ImageTransformKJ": {"class": ImageTransformKJ, "name": "Image Transform KJ"},
     "BBOXToBoundingBoxKJ": {"class": BBOXToBoundingBoxKJ, "name": "BBOX to Bounding Box KJ"},
     "Ideogram4PromptBuilderKJ": {"class": Ideogram4PromptBuilderKJ, "name": "Ideogram 4 Prompt Builder KJ"},
+    "Flux3PromptBuilderKJ": {"class": Flux3PromptBuilderKJ, "name": "FLUX.3 Prompt Builder KJ"},
+    "Flux3BoxReconcileKJ": {"class": Flux3BoxReconcileKJ, "name": "FLUX.3 Box Reconcile KJ"},
+    "MossImagePromptBuilderKJ": {"class": MossImagePromptBuilderKJ, "name": "MOSS-Image Prompt Builder KJ"},
     "HDRPreviewKJ": {"class": HDRPreviewKJ, "name": "HDR Preview KJ"},
     "ModelPreviewOverrideKJ": {"class": ModelPreviewOverrideKJ, "name": "Model Preview Override KJ"},
     "GetPreviewOverrideFramesKJ": {"class": GetPreviewOverrideFramesKJ, "name": "Get Preview Override Frames KJ"},
@@ -299,6 +305,7 @@ NODE_CONFIG = {
     "ModelPatchTorchSettings": {"class": ModelPatchTorchSettings, "name": "Model Patch Torch Settings"},
     "WanVideoNAG": {"class": WanVideoNAG, "name": "WanVideoNAG"},
     "Krea2PromptWeight": {"class": Krea2PromptWeight, "name": "Krea2 Prompt Weight"},
+    "MossImagePromptWeight": {"class": MossImagePromptWeight, "name": "MOSS-Image Prompt Weight"},
     "GGUFLoaderKJ": {"class": GGUFLoaderKJ, "name": "GGUF Loader KJ"},
     "LatentInpaintTTM": {"class": LatentInpaintTTM, "name": "Latent Inpaint TTM"},
     "NABLA_AttentionKJ": {"class": NABLA_AttentionKJ, "name": "NABLA Attention KJ"},
@@ -322,6 +329,8 @@ NODE_CONFIG = {
     #lora
     "LoraExtractKJ": {"class": LoraExtractKJ, "name": "LoraExtractKJ"},
     "LoraReduceRankKJ": {"class": LoraReduceRank, "name": "LoraReduceRank"},
+    #looping
+    **{n.GET_SCHEMA().node_id: {"class": n, "name": n.GET_SCHEMA().display_name} for n in LOOP_NODES},
 
     #tracks
     "GetTrackRange": {"class": GetTrackRange, "name": "Get Track Range"},
