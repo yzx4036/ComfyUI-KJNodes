@@ -1,10 +1,48 @@
 import torch
 from torchvision import transforms
 import json
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 import numpy as np
-from ..utility.utility import pil2tensor
+from ..utility.utility import pil2tensor, tensor2pil
 import folder_paths
+import base64
+from io import BytesIO
+
+
+def parse_color(color):
+    if isinstance(color, str) and ',' in color:
+        return tuple(int(c.strip()) for c in color.split(','))
+    return color
+
+def parse_json_tracks(tracks):
+    tracks_data = []
+    try:
+        # If tracks is a string, try to parse it as JSON
+        if isinstance(tracks, str):
+            parsed = json.loads(tracks.replace("'", '"'))
+            tracks_data.extend(parsed)
+        else:
+            # If tracks is a list of strings, parse each one
+            for track_str in tracks:
+                parsed = json.loads(track_str.replace("'", '"'))
+                tracks_data.append(parsed)
+        
+        # Check if we have a single track (dict with x,y) or a list of tracks
+        if tracks_data and isinstance(tracks_data[0], dict) and 'x' in tracks_data[0]:
+            # Single track detected, wrap it in a list
+            tracks_data = [tracks_data]
+        elif tracks_data and isinstance(tracks_data[0], list) and tracks_data[0] and isinstance(tracks_data[0][0], dict) and 'x' in tracks_data[0][0]:
+            # Already a list of tracks, nothing to do
+            pass
+        else:
+            # Unexpected format
+            print(f"Warning: Unexpected track format: {type(tracks_data[0])}")
+            
+    except json.JSONDecodeError as e:
+        print(f"Error parsing tracks JSON: {e}")
+        tracks_data = []
+
+    return tracks_data
 
 def plot_coordinates_to_tensor(coordinates, height, width, bbox_height, bbox_width, size_multiplier, prompt):
         import matplotlib
@@ -55,7 +93,11 @@ def plot_coordinates_to_tensor(coordinates, height, width, bbox_height, bbox_wid
                                             color=color,
                                             mutation_scale=20))
             canvas.draw()
-            image_np = np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(int(height), int(width), 3).copy()
+            try:
+                image_np = np.frombuffer(canvas.tostring_rgb(), dtype='uint8').reshape(int(height), int(width), 3).copy()
+            except AttributeError:
+                image_np = np.frombuffer(canvas.tostring_argb(), dtype='uint8').reshape(int(height), int(width), 4)
+                image_np = image_np[:, :, [1, 2, 3]]  # Convert ARGB to RGB
             image_tensor = torch.from_numpy(image_np).float() / 255.0
             image_tensor = image_tensor.unsqueeze(0)
             image_batch.append(image_tensor)
@@ -90,22 +132,24 @@ Plots coordinates to sequence of images using Matplotlib.
     def append(self, coordinates, text, width, height, bbox_width, bbox_height, size_multiplier=[1.0]):
         coordinates = json.loads(coordinates.replace("'", '"'))
         coordinates = [(coord['x'], coord['y']) for coord in coordinates]
-        batch_size = len(coordinates)    
-        if len(size_multiplier) != batch_size:
+        batch_size = len(coordinates)
+        if not size_multiplier or len(size_multiplier) != batch_size:
+            size_multiplier = [0] * batch_size
+        else:
             size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
 
         plot_image_tensor = plot_coordinates_to_tensor(coordinates, height, width, bbox_height, bbox_width, size_multiplier, text)
         
         return (plot_image_tensor, width, height, bbox_width, bbox_height)
-    
+
 class SplineEditor:
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "points_store": ("STRING", {"multiline": False}),
-                "coordinates": ("STRING", {"multiline": False}),
+                "points_store": ("STRING", {"multiline": False, "advanced": True}),
+                "coordinates": ("STRING", {"multiline": False, "advanced": True}),
                 "mask_width": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
                 "mask_height": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
                 "points_to_sample": ("INT", {"default": 16, "min": 2, "max": 1000, "step": 1}),
@@ -113,12 +157,14 @@ class SplineEditor:
                 [   
                     'path',
                     'time',
+                    'controlpoints',
+                    'speed'
                 ],
                 {
                     "default": 'time'
                 }),
                 "interpolation": (
-                [   
+                [
                     'cardinal',
                     'monotone',
                     'basis',
@@ -127,6 +173,7 @@ class SplineEditor:
                     'step-after',
                     'polar',
                     'polar-reverse',
+                    'bezier',
                 ],
                 {
                 "default": 'cardinal'
@@ -134,7 +181,7 @@ class SplineEditor:
                 "tension": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "repeat_output": ("INT", {"default": 1, "min": 1, "max": 4096, "step": 1}),
                 "float_output_type": (
-                [   
+                [
                     'list',
                     'pandas series',
                     'tensor',
@@ -146,12 +193,12 @@ class SplineEditor:
             "optional": {
                 "min_value": ("FLOAT", {"default": 0.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
                 "max_value": ("FLOAT", {"default": 1.0, "min": -10000.0, "max": 10000.0, "step": 0.01}),
-                "editor_link": ("EDITORLINK",),
+                "bg_image": ("IMAGE", ),
             }
         }
 
-    RETURN_TYPES = ("MASK", "STRING", "FLOAT", "INT", "EDITORLINK",)
-    RETURN_NAMES = ("mask", "coord_str", "float", "count", "editor_link",)
+    RETURN_TYPES = ("MASK", "STRING", "FLOAT", "INT", "STRING",)
+    RETURN_NAMES = ("mask", "coord_str", "float", "count", "normalized_str",)
     FUNCTION = "splinedata"
     CATEGORY = "KJNodes/weights"
     DESCRIPTION = """
@@ -169,6 +216,16 @@ guaranteed!!
 Note that you can't delete from start/end.  
   
 Right click on canvas for context menu:  
+NEW!:
+- Add new spline
+    - Creates a new spline on same canvas, currently these paths are only outputed  
+      as coordinates.
+- Add single point
+    - Creates a single point that only returns it's current position coords  
+- Delete spline
+    - Deletes the currently selected spline, you can select a spline by clicking on   
+    it's path, or cycle through them with the 'Next spline' -option.  
+
 These are purely visual options, doesn't affect the output:  
  - Toggle handles visibility
  - Display sample points: display the points to be returned.  
@@ -179,6 +236,7 @@ actual control points, so the interpolation type matters.
 sampling_method: 
  - time: samples along the time axis, used for schedules  
  - path: samples along the path itself, useful for coordinates  
+ - controlpoints: samples only the control points themselves  
 
 output types:
  - mask batch  
@@ -193,36 +251,79 @@ output types:
 """
 
     def splinedata(self, mask_width, mask_height, coordinates, float_output_type, interpolation, 
-                   points_to_sample, sampling_method, points_store, tension, repeat_output, min_value=0.0, max_value=1.0, editor_link=None):
-        
+               points_to_sample, sampling_method, points_store, tension, repeat_output, 
+               min_value=0.0, max_value=1.0, bg_image=None):
+    
         coordinates = json.loads(coordinates)
-        for coord in coordinates:
-            coord['x'] = int(round(coord['x']))
-            coord['y'] = int(round(coord['y']))
-            
-        normalized_y_values = [
-            (1.0 - (point['y'] / mask_height) - 0.0) * (max_value - min_value) + min_value
-            for point in coordinates
-        ]
+        
+        # Handle nested list structure if present
+        all_normalized = []
+        all_normalized_y_values = []
+
+        # Check if we have a nested list structure
+        if isinstance(coordinates, list) and len(coordinates) > 0 and isinstance(coordinates[0], list):
+            # Process each list of coordinates in the nested structure
+            coordinate_sets = coordinates
+        else:
+            # If not nested, treat as a single list of coordinates
+            coordinate_sets = [coordinates]
+
+        first_spline = coordinate_sets[0] if coordinate_sets else []
+
+        # Process each set of coordinates
+        for coord_set in coordinate_sets:
+            normalized = []
+            normalized_y_values = []
+
+            for coord in coord_set:
+                coord['x'] = int(round(coord['x']))
+                coord['y'] = int(round(coord['y']))
+                norm_x = (1.0 - (coord['x'] / mask_height) - 0.0) * (max_value - min_value) + min_value
+                norm_y = (1.0 - (coord['y'] / mask_height) - 0.0) * (max_value - min_value) + min_value
+                normalized_y_values.append(norm_y)
+                normalized.append({'x':norm_x, 'y':norm_y})
+
+            all_normalized.extend(normalized)
+            all_normalized_y_values.extend(normalized_y_values)
+
+        # Use the combined normalized values for output
         if float_output_type == 'list':
-            out_floats = normalized_y_values * repeat_output
+            out_floats = all_normalized_y_values * repeat_output
         elif float_output_type == 'pandas series':
             try:
                 import pandas as pd
-            except:
-                raise Exception("MaskOrImageToWeight: pandas is not installed. Please install pandas to use this output_type")
-            out_floats = pd.Series(normalized_y_values * repeat_output),
+            except ImportError as e:
+                raise ImportError("MaskOrImageToWeight: pandas is not installed. Please install pandas to use this output_type") from e
+            out_floats = pd.Series(all_normalized_y_values * repeat_output),
         elif float_output_type == 'tensor':
-            out_floats = torch.tensor(normalized_y_values * repeat_output, dtype=torch.float32)
-        # Create a color map for grayscale intensities
-        color_map = lambda y: torch.full((mask_height, mask_width, 3), y, dtype=torch.float32)
+            out_floats = torch.tensor(all_normalized_y_values * repeat_output, dtype=torch.float32)
 
-        # Create image tensors for each normalized y value
-        mask_tensors = [color_map(y) for y in normalized_y_values]
+        color_map = lambda y: torch.full((mask_height, mask_width, 3), y, dtype=torch.float32)
+        y_values_for_masks = normalized_y_values if normalized_y_values else [min_value]
+        mask_tensors = [color_map(y) for y in y_values_for_masks]
         masks_out = torch.stack(mask_tensors)
         masks_out = masks_out.repeat(repeat_output, 1, 1, 1)
         masks_out = masks_out.mean(dim=-1)
-        return (masks_out, str(coordinates), out_floats, len(out_floats), editor_link,)
+
+        single_spline_count = len(first_spline)
+
+        if bg_image is None:
+            return (masks_out, json.dumps(coordinates if len(coordinates) > 1 else coordinates[0]), out_floats, single_spline_count, json.dumps(all_normalized))
+        else:
+            transform = transforms.ToPILImage()
+            image = transform(bg_image[0].permute(2, 0, 1))
+            buffered = BytesIO()
+            image.save(buffered, format="JPEG", quality=75)
+
+            # Encode the image bytes to a Base64 string
+            img_bytes = buffered.getvalue()
+            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+
+            return {
+                "ui": {"bg_image": [img_base64]},
+                "result": (masks_out, json.dumps(coordinates if len(coordinates) > 1 else coordinates[0]), out_floats, single_spline_count, json.dumps(all_normalized))
+            }
+
 
 class CreateShapeMaskOnPath:
     
@@ -233,8 +334,8 @@ class CreateShapeMaskOnPath:
     DESCRIPTION = """
 Creates a mask or batch of masks with the specified shape.  
 Locations are center locations.  
-Grow value is the amount to grow the shape on each frame, creating animated masks.
 """
+    DEPRECATED = True
 
     @classmethod
     def INPUT_TYPES(s):
@@ -267,7 +368,9 @@ Grow value is the amount to grow the shape on each frame, creating animated mask
         batch_size = len(coordinates)
         out = []
         color = "white"
-        if len(size_multiplier) != batch_size:
+        if not size_multiplier or len(size_multiplier) != batch_size:
+            size_multiplier = [0] * batch_size
+        else:
             size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
         for i, coord in enumerate(coordinates):
             image = Image.new("RGB", (frame_width, frame_height), "black")
@@ -303,6 +406,320 @@ Grow value is the amount to grow the shape on each frame, creating animated mask
             out.append(mask)
         outstack = torch.cat(out, dim=0)
         return (outstack, 1.0 - outstack,)
+
+
+
+class CreateShapeImageOnPath:
+    
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("image","mask", )
+    FUNCTION = "createshapemask"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Creates an image or batch of images with the specified shape.  
+Locations are center locations.  
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "shape": (
+            [   'circle',
+                'square',
+                'triangle',
+            ],
+            {
+            "default": 'circle'
+             }),
+                "coordinates": ("STRING", {"forceInput": True}),
+                "frame_width": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "frame_height": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "shape_width": ("INT", {"default": 128,"min": 2, "max": 4096, "step": 1}),
+                "shape_height": ("INT", {"default": 128,"min": 2, "max": 4096, "step": 1}),
+                "shape_color": ("STRING", {"default": 'white'}),
+                "bg_color": ("STRING", {"default": 'black'}),
+                "blur_radius": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100, "step": 0.1}),
+                "intensity": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+        },
+        "optional": {
+            "size_multiplier": ("FLOAT", {"default": [1.0], "forceInput": True}),
+            "trailing": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
+            "border_width": ("INT", {"default": 0, "min": 0, "max": 100, "step": 1}),
+            "border_color": ("STRING", {"default": 'black'}),
+        }
+    } 
+
+    def createshapemask(self, coordinates, frame_width, frame_height, shape_width, shape_height, shape_color, 
+                        bg_color, blur_radius, shape, intensity, size_multiplier=[1.0], trailing=1.0, border_width=0, border_color='black'):
+
+        shape_color = parse_color(shape_color)
+        border_color = parse_color(border_color)
+        bg_color = parse_color(bg_color)
+        coords_list = parse_json_tracks(coordinates)
+
+        batch_size = len(coords_list[0])
+        images_list = []
+        masks_list = []
+
+        if not size_multiplier or len(size_multiplier) != batch_size:
+            size_multiplier = [1] * batch_size
+        else:
+            size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
+
+        previous_output = None
+
+        for i in range(batch_size):
+            image = Image.new("RGB", (frame_width, frame_height), bg_color)
+            draw = ImageDraw.Draw(image)
+
+            # Calculate the size for this frame and ensure it's not less than 0
+            current_width = shape_width * size_multiplier[i]
+            current_height = shape_height * size_multiplier[i]
+            
+            for coords in coords_list:
+                location_x = coords[i]['x']
+                location_y = coords[i]['y']
+            
+                if shape == 'circle' or shape == 'square':
+                    # Define the bounding box for the shape
+                    left_up_point = (location_x - current_width // 2, location_y - current_height // 2)
+                    right_down_point = (location_x + current_width // 2, location_y + current_height // 2)
+                    two_points = [left_up_point, right_down_point]
+
+                    if shape == 'circle':
+                        if border_width > 0:
+                            draw.ellipse(two_points, fill=shape_color, outline=border_color, width=border_width)
+                        else:
+                            draw.ellipse(two_points, fill=shape_color)
+                    elif shape == 'square':
+                        if border_width > 0:
+                            draw.rectangle(two_points, fill=shape_color, outline=border_color, width=border_width)
+                        else:
+                            draw.rectangle(two_points, fill=shape_color)
+                        
+                elif shape == 'triangle':
+                    # Define the points for the triangle
+                    left_up_point = (location_x - current_width // 2, location_y + current_height // 2) # bottom left
+                    right_down_point = (location_x + current_width // 2, location_y + current_height // 2) # bottom right
+                    top_point = (location_x, location_y - current_height // 2) # top point
+                    
+                    if border_width > 0:
+                        draw.polygon([top_point, left_up_point, right_down_point], fill=shape_color, outline=border_color, width=border_width)
+                    else:
+                        draw.polygon([top_point, left_up_point, right_down_point], fill=shape_color)
+
+            if blur_radius != 0:
+                    image = image.filter(ImageFilter.GaussianBlur(blur_radius))
+            # Blend the current image with the accumulated image
+            
+            image = pil2tensor(image)
+            if trailing != 1.0 and previous_output is not None:
+                # Add the decayed previous output to the current frame
+                image += trailing * previous_output
+                image = image / image.max()
+            previous_output = image
+            image = image * intensity
+            mask = image[:, :, :, 0]
+            masks_list.append(mask)
+            images_list.append(image)
+        out_images = torch.cat(images_list, dim=0).cpu().float()
+        out_masks = torch.cat(masks_list, dim=0)
+        return (out_images, out_masks)
+    
+class CreateTextOnPath:
+    
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK",)
+    RETURN_NAMES = ("image", "mask", "mask_inverted",)
+    FUNCTION = "createtextmask"
+    CATEGORY = "KJNodes/masking/generate"
+    DESCRIPTION = """
+Creates a mask or batch of masks with the specified text.  
+Locations are center locations.  
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "coordinates": ("STRING", {"forceInput": True}),
+                "text": ("STRING", {"default": 'text', "multiline": True}),
+                "frame_width": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "frame_height": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "font": (folder_paths.get_filename_list("kjnodes_fonts"), ),
+                "font_size": ("INT", {"default": 42}),
+                 "alignment": (
+                [   'left',
+                    'center',
+                    'right'
+                ],
+                {"default": 'center'}
+                ),
+                "text_color": ("STRING", {"default": 'white'}),
+        },
+        "optional": {
+            "size_multiplier": ("FLOAT", {"default": [1.0], "forceInput": True}),
+        }
+    } 
+
+    def createtextmask(self, coordinates, frame_width, frame_height, font, font_size, text, text_color, alignment, size_multiplier=[1.0]):
+        coordinates = coordinates.replace("'", '"')
+        coordinates = json.loads(coordinates)
+
+        batch_size = len(coordinates)
+        mask_list = []
+        image_list = []
+        color = parse_color(text_color)
+        font_path = folder_paths.get_full_path("kjnodes_fonts", font)
+
+        if len(size_multiplier) != batch_size:
+            size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
+        
+        for i, coord in enumerate(coordinates):
+            image = Image.new("RGB", (frame_width, frame_height), "black")
+            draw = ImageDraw.Draw(image)
+            lines = text.split('\n')  # Split the text into lines
+            # Apply the size multiplier to the font size for this iteration
+            current_font_size = int(font_size * size_multiplier[i])
+            current_font = ImageFont.truetype(font_path, current_font_size)
+            line_heights = [current_font.getbbox(line)[3] for line in lines]  # List of line heights
+            total_text_height = sum(line_heights)  # Total height of text block
+
+            # Calculate the starting Y position to center the block of text
+            start_y = coord['y'] - total_text_height // 2
+            for j, line in enumerate(lines):
+                text_width, text_height = current_font.getbbox(line)[2], line_heights[j]
+                if alignment == 'left':
+                    location_x = coord['x']
+                elif alignment == 'center':
+                    location_x = int(coord['x'] - text_width // 2)
+                elif alignment == 'right':
+                    location_x = int(coord['x'] - text_width)
+                
+                location_y = int(start_y + sum(line_heights[:j]))
+                text_position = (location_x, location_y)
+                # Draw the text
+                try:
+                    draw.text(text_position, line, fill=color, font=current_font, features=['-liga'])
+                except Exception:
+                    draw.text(text_position, line, fill=color, font=current_font)
+            
+            image = pil2tensor(image)
+            non_black_pixels = (image > 0).any(dim=-1)
+            mask = non_black_pixels.to(image.dtype)
+            mask_list.append(mask)
+            image_list.append(image)
+
+        out_images = torch.cat(image_list, dim=0).cpu().float()
+        out_masks = torch.cat(mask_list, dim=0)
+        return (out_images, out_masks, 1.0 - out_masks,)
+
+class CreateGradientFromCoords:
+    
+    RETURN_TYPES = ("IMAGE", )
+    RETURN_NAMES = ("image", )
+    FUNCTION = "generate"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Creates a gradient image from coordinates.    
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "coordinates": ("STRING", {"forceInput": True}),
+                "frame_width": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "frame_height": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "start_color": ("STRING", {"default": 'white'}),
+                "end_color": ("STRING", {"default": 'black'}),
+                "multiplier": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01}),
+        },
+    } 
+    
+    def generate(self, coordinates, frame_width, frame_height, start_color, end_color, multiplier):
+        # Parse the coordinates
+        coordinates = json.loads(coordinates.replace("'", '"'))
+
+        # Create an image
+        image = Image.new("RGB", (frame_width, frame_height))
+        draw = ImageDraw.Draw(image)
+
+        # Extract start and end points for the gradient
+        start_coord = coordinates[0]
+        end_coord = coordinates[1]
+
+        start_color = parse_color(start_color)
+        end_color = parse_color(end_color)
+
+        # Calculate the gradient direction (vector)
+        gradient_direction = (end_coord['x'] - start_coord['x'], end_coord['y'] - start_coord['y'])
+        gradient_length = (gradient_direction[0] ** 2 + gradient_direction[1] ** 2) ** 0.5
+
+        # Iterate over each pixel in the image
+        for y in range(frame_height):
+            for x in range(frame_width):
+                # Calculate the projection of the point on the gradient line
+                point_vector = (x - start_coord['x'], y - start_coord['y'])
+                projection = (point_vector[0] * gradient_direction[0] + point_vector[1] * gradient_direction[1]) / gradient_length
+                projection = max(min(projection, gradient_length), 0)  # Clamp the projection value
+
+                # Calculate the blend factor for the current pixel
+                blend = projection * multiplier / gradient_length 
+
+                # Determine the color of the current pixel
+                color = (
+                    int(start_color[0] + (end_color[0] - start_color[0]) * blend),
+                    int(start_color[1] + (end_color[1] - start_color[1]) * blend),
+                    int(start_color[2] + (end_color[2] - start_color[2]) * blend)
+                )
+
+                # Set the pixel color
+                draw.point((x, y), fill=color)
+
+        # Convert the PIL image to a tensor (assuming such a function exists in your context)
+        image_tensor = pil2tensor(image)
+
+        return (image_tensor,)
+
+class GradientToFloat:
+    
+    RETURN_TYPES = ("FLOAT", "FLOAT",)
+    RETURN_NAMES = ("float_x", "float_y", )
+    FUNCTION = "sample"
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Calculates list of floats from image.    
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE", ),
+                "steps": ("INT", {"default": 10, "min": 2, "max": 10000, "step": 1}),
+        },
+    } 
+    
+    def sample(self, image, steps):
+        # Assuming image is a tensor with shape [B, H, W, C]
+        B, H, W, C = image.shape
+
+        # Sample along the width axis (W)
+        w_intervals = torch.linspace(0, W - 1, steps=steps, dtype=torch.int64)
+        # Assuming we're sampling from the first batch and the first channel
+        w_sampled = image[0, :, w_intervals, 0]
+
+        # Sample along the height axis (H)
+        h_intervals = torch.linspace(0, H - 1, steps=steps, dtype=torch.int64)
+        # Assuming we're sampling from the first batch and the first channel
+        h_sampled = image[0, h_intervals, :, 0]
+
+        # Taking the mean across the height for width sampling, and across the width for height sampling
+        w_values = w_sampled.mean(dim=0).tolist()
+        h_values = h_sampled.mean(dim=1).tolist()
+
+        return (w_values, h_values)
     
 class MaskOrImageToWeight:
 
@@ -344,16 +761,16 @@ and returns that as the selected output type.
             for image in images:
                 mean_values.append(image.mean().item())
         elif masks is not None and images is not None:
-            raise Exception("MaskOrImageToWeight: Use either mask or image input only.")
+            raise ValueError("MaskOrImageToWeight: Use either mask or image input only.")
                   
         # Convert mean_values to the specified output_type
         if output_type == 'list':
-            out = mean_values,
+            out = mean_values
         elif output_type == 'pandas series':
             try:
                 import pandas as pd
-            except:
-                raise Exception("MaskOrImageToWeight: pandas is not installed. Please install pandas to use this output_type")
+            except ImportError as e:
+                raise ImportError("MaskOrImageToWeight: pandas is not installed. Please install pandas to use this output_type") from e
             out = pd.Series(mean_values),
         elif output_type == 'tensor':
             out = torch.tensor(mean_values, dtype=torch.float32),
@@ -605,6 +1022,25 @@ Creates a sigmas tensor from list of float values.
     def customsigmas(self, float_list):
         return torch.tensor(float_list, dtype=torch.float32),
 
+class SigmasToFloat:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required":
+                    {
+                     "sigmas": ("SIGMAS",),
+                     }
+                }
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("float",)
+    CATEGORY = "KJNodes/noise"
+    FUNCTION = "customsigmas"
+    DESCRIPTION = """
+Creates a float list from sigmas tensors.  
+
+"""
+    def customsigmas(self, sigmas):
+        return sigmas.tolist(),
+
 class GLIGENTextBoxApplyBatchCoords:
     @classmethod
     def INPUT_TYPES(s):
@@ -733,8 +1169,10 @@ for example:
         batch_size = len(coordinates)
         # Initialize a list to hold the coordinates for the current ID
         id_coordinates = []
-        if len(size_multiplier) != batch_size:
-                size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
+        if not size_multiplier or len(size_multiplier) != batch_size:
+            size_multiplier = [0] * batch_size
+        else:
+            size_multiplier = size_multiplier * (batch_size // len(size_multiplier)) + size_multiplier[:batch_size % len(size_multiplier)]
         for i, coord in enumerate(coordinates):
             x = coord['x']
             y = coord['y']
@@ -752,6 +1190,13 @@ for example:
                 top_left_y = max(0, top_left_y)
                 bottom_right_x = min(width, bottom_right_x)
                 bottom_right_y = min(height, bottom_right_y)
+                # Ensure width and height are positive
+                adjusted_bbox_width = max(1, bottom_right_x - top_left_x)
+                adjusted_bbox_height = max(1, bottom_right_y - top_left_y)
+
+                # Update the coordinates with the new width and height
+                bottom_right_x = top_left_x + adjusted_bbox_width
+                bottom_right_y = top_left_y + adjusted_bbox_height
 
             # Append the top left and bottom right coordinates to the list for the current ID
             id_coordinates.append([top_left_x, top_left_y, bottom_right_x, bottom_right_y, width, height])
@@ -831,48 +1276,51 @@ Interpolates coordinates based on a curve.
     } 
 
     def interpolate(self, coordinates, interpolation_curve):
-         # Parse the JSON string to get the list of coordinates
+        # Parse the JSON string to get the list of coordinates
         coordinates = json.loads(coordinates.replace("'", '"'))
 
         # Convert the list of dictionaries to a list of (x, y) tuples for easier processing
         coordinates = [(coord['x'], coord['y']) for coord in coordinates]
 
         # Calculate the total length of the original path
-        path_length = sum(np.linalg.norm(np.array(coordinates[i]) - np.array(coordinates[i-1])) for i in range(1, len(coordinates)))
-
-        # Normalize the interpolation curve
-        normalized_curve = [x / path_length for x in interpolation_curve]
+        path_length = sum(np.linalg.norm(np.array(coordinates[i]) - np.array(coordinates[i-1])) 
+                        for i in range(1, len(coordinates)))
 
         # Initialize variables for interpolation
         interpolated_coords = []
         current_length = 0
-        current_index = 1
+        current_index = 0
 
         # Iterate over the normalized curve
-        for target_length in normalized_curve:
-            target_length *= path_length # Convert back to the original scale
-            while current_length < target_length and current_index < len(coordinates):
-                segment_length = np.linalg.norm(np.array(coordinates[current_index]) - np.array(coordinates[current_index-1]))
+        for normalized_length in interpolation_curve:
+            target_length = normalized_length * path_length # Convert to the original scale
+            while current_index < len(coordinates) - 1:
+                segment_start, segment_end = np.array(coordinates[current_index]), np.array(coordinates[current_index + 1])
+                segment_length = np.linalg.norm(segment_end - segment_start)
+                if current_length + segment_length >= target_length:
+                    break
                 current_length += segment_length
                 current_index += 1
 
             # Interpolate between the last two points
-            if current_index == 1:
-                interpolated_coords.append(coordinates[0])
-            else:
-                p1, p2 = np.array(coordinates[current_index-2]), np.array(coordinates[current_index-1])
+            if current_index < len(coordinates) - 1:
+                p1, p2 = np.array(coordinates[current_index]), np.array(coordinates[current_index + 1])
                 segment_length = np.linalg.norm(p2 - p1)
                 if segment_length > 0:
-                    t = (target_length - (current_length - segment_length)) / segment_length
+                    t = (target_length - current_length) / segment_length
                     interpolated_point = p1 + t * (p2 - p1)
                     interpolated_coords.append(interpolated_point.tolist())
                 else:
                     interpolated_coords.append(p1.tolist())
+            else:
+                # If the target_length is at or beyond the end of the path, add the last coordinate
+                interpolated_coords.append(coordinates[-1])
 
         # Convert back to string format if necessary
         interpolated_coords_str = "[" + ", ".join([f"{{'x': {round(coord[0])}, 'y': {round(coord[1])}}}" for coord in interpolated_coords]) + "]"
+        print(interpolated_coords_str)
 
-        return (interpolated_coords_str, )
+        return (interpolated_coords_str,)
     
 class DrawInstanceDiffusionTracking:
     
@@ -951,3 +1399,244 @@ CreateInstanceDiffusionTracking -node.
         image_tensor_batch = torch.stack(modified_images).cpu().float()
         
         return image_tensor_batch,
+
+class PointsEditor:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "points_store": ("STRING", {"multiline": False, "advanced": True}),
+                "coordinates": ("STRING", {"multiline": False, "socketless": True, "advanced": True}),
+                "neg_coordinates": ("STRING", {"multiline": False, "socketless": True, "advanced": True}),
+                "bbox_store": ("STRING", {"multiline": False, "advanced": True}),
+                "bboxes": ("STRING", {"multiline": False, "socketless": True, "advanced": True}),
+                "bbox_format": (
+                [
+                    'xyxy',
+                    'xywh',
+                ],
+                ),
+                "width": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
+                "height": ("INT", {"default": 512, "min": 8, "max": 4096, "step": 8}),
+                "normalize": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "bg_image": ("IMAGE", ),
+            },
+        }
+
+    RETURN_TYPES = ("STRING", "STRING", "BBOX", "MASK", "IMAGE")
+    RETURN_NAMES = ("positive_coords", "negative_coords", "bbox", "bbox_mask", "cropped_image")
+    FUNCTION = "pointdata"
+    CATEGORY = "KJNodes/experimental"
+    DESCRIPTION = """
+# WORK IN PROGRESS
+Do not count on this as part of your workflow yet,
+probably contains lots of bugs and stability is not
+guaranteed!!
+
+## Graphical editor to create coordinates
+
+**Shift + click** to add a positive (green) point.
+**Shift + right click** to add a negative (red) point.
+**Right click on a point** to delete it.
+**Ctrl + click** to draw a bounding box.
+**Drag bbox corners** to resize, **drag inside** to move.
+**Right click on bbox** to delete it.
+
+To add an image select the node and copy/paste or drag in the image.
+Or from the bg_image input on queue (first frame of the batch).
+
+**THE IMAGE IS SAVED TO THE NODE AND WORKFLOW METADATA**
+you can clear the image from the context menu by right clicking on the canvas
+
+"""
+
+    def pointdata(self, points_store, bbox_store, width, height, coordinates, neg_coordinates, normalize, bboxes, bbox_format="xyxy", bg_image=None):
+        coordinates = json.loads(coordinates)
+        if not coordinates:
+            raise ValueError("No points on the canvas. Use Shift+click to add positive points or Shift+right-click to add negative points before executing.")
+        pos_coordinates = []
+        for coord in coordinates:
+            coord['x'] = int(round(coord['x']))
+            coord['y'] = int(round(coord['y']))
+            if normalize:
+                norm_x = coord['x'] / width
+                norm_y = coord['y'] / height
+                pos_coordinates.append({'x': norm_x, 'y': norm_y})
+            else:
+                pos_coordinates.append({'x': coord['x'], 'y': coord['y']})
+
+        if neg_coordinates:
+            coordinates = json.loads(neg_coordinates)
+            neg_coordinates = []
+            for coord in coordinates:
+                coord['x'] = int(round(coord['x']))
+                coord['y'] = int(round(coord['y']))
+                if normalize:
+                    norm_x = coord['x'] / width
+                    norm_y = coord['y'] / height
+                    neg_coordinates.append({'x': norm_x, 'y': norm_y})
+                else:
+                    neg_coordinates.append({'x': coord['x'], 'y': coord['y']})
+
+        # Create a blank mask
+        mask = np.zeros((height, width), dtype=np.uint8)
+        bboxes = json.loads(bboxes)
+        valid_bboxes = []
+        for bbox in bboxes:
+            if (bbox.get("startX") is None or
+                bbox.get("startY") is None or
+                bbox.get("endX") is None or
+                bbox.get("endY") is None):
+                continue  # Skip this bounding box if any value is None
+            else:                
+                # Ensure that endX and endY are greater than startX and startY
+                x_min = min(int(bbox["startX"]), int(bbox["endX"]))
+                y_min = min(int(bbox["startY"]), int(bbox["endY"]))
+                x_max = max(int(bbox["startX"]), int(bbox["endX"]))
+                y_max = max(int(bbox["startY"]), int(bbox["endY"]))
+                
+                valid_bboxes.append((x_min, y_min, x_max, y_max))
+
+            bboxes_xyxy = []
+            for bbox in valid_bboxes:
+                x_min, y_min, x_max, y_max = bbox
+                bboxes_xyxy.append((x_min, y_min, x_max, y_max))
+                mask[y_min:y_max, x_min:x_max] = 1  # Fill the bounding box area with 1s
+
+            if bbox_format == "xywh":
+                bboxes_xywh = []
+                for bbox in valid_bboxes:
+                    x_min, y_min, x_max, y_max = bbox
+                    width = x_max - x_min
+                    height = y_max - y_min
+                    bboxes_xywh.append((x_min, y_min, width, height))
+                bboxes = bboxes_xywh
+            else:
+                bboxes = bboxes_xyxy           
+
+        mask_tensor = torch.from_numpy(mask)
+        mask_tensor = mask_tensor.unsqueeze(0).float().cpu()
+
+        if bg_image is not None and len(valid_bboxes) > 0:
+            x_min, y_min, x_max, y_max = bboxes[0]
+            cropped_image = bg_image[:, y_min:y_max, x_min:x_max, :]
+        elif bg_image is not None:
+            cropped_image = bg_image
+        else:
+            cropped_image = torch.zeros(1, height, width, 3, dtype=torch.float32)
+
+        if bg_image is None:
+            return (json.dumps(pos_coordinates), json.dumps(neg_coordinates), bboxes, mask_tensor, cropped_image)
+        else:
+            transform = transforms.ToPILImage()
+            image = transform(bg_image[0].permute(2, 0, 1))
+            buffered = BytesIO()
+            image.save(buffered, format="JPEG", quality=75)
+            img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+            return {
+                "ui": {"bg_image": [img_base64]},
+                "result": (json.dumps(pos_coordinates), json.dumps(neg_coordinates), bboxes, mask_tensor, cropped_image)
+            }
+
+class CutAndDragOnPath:
+    RETURN_TYPES = ("IMAGE", "MASK",)
+    RETURN_NAMES = ("image","mask", )
+    FUNCTION = "cutanddrag" 
+    CATEGORY = "KJNodes/image"
+    DESCRIPTION = """
+Cuts the masked area from the image, and drags it along the path. If inpaint is enabled, and no bg_image is provided, the cut area is filled using cv2 TELEA algorithm.
+"""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "coordinates": ("STRING", {"forceInput": True}),
+                "mask": ("MASK",),
+                "frame_width": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "frame_height": ("INT", {"default": 512,"min": 16, "max": 4096, "step": 1}),
+                "inpaint": ("BOOLEAN", {"default": True}),
+        },
+        "optional": {
+            "bg_image": ("IMAGE",),
+        }
+    }
+
+    def cutanddrag(self, image, coordinates, mask, frame_width, frame_height, inpaint, bg_image=None):
+        # Parse coordinates
+        coords_list = parse_json_tracks(coordinates)
+
+        batch_size = len(coords_list[0])
+        images_list = []
+        masks_list = []
+
+        # Convert input image and mask to PIL
+        input_image = tensor2pil(image)[0]
+        input_mask = tensor2pil(mask)[0]
+
+        # Find masked region bounds
+        mask_array = np.array(input_mask)
+        y_indices, x_indices = np.where(mask_array > 0)
+        if len(x_indices) == 0 or len(y_indices) == 0:
+            return (image, mask)
+            
+        x_min, x_max = x_indices.min(), x_indices.max()
+        y_min, y_max = y_indices.min(), y_indices.max()
+        
+        # Cut out the masked region
+        cut_width = x_max - x_min
+        cut_height = y_max - y_min
+        cut_image = input_image.crop((x_min, y_min, x_max, y_max))
+        cut_mask = input_mask.crop((x_min, y_min, x_max, y_max))
+        
+        # Create inpainted background
+        if bg_image is None:
+            background = input_image.copy()
+            # Inpaint the cut area
+            if inpaint:
+                import cv2
+                border = 5 # Create small border around cut area for better inpainting
+                fill_mask = Image.new("L", background.size, 0)
+                draw = ImageDraw.Draw(fill_mask)
+                draw.rectangle([x_min-border, y_min-border, x_max+border, y_max+border], fill=255)
+                background = cv2.inpaint(
+                    np.array(background), 
+                    np.array(fill_mask), 
+                    inpaintRadius=3, 
+                    flags=cv2.INPAINT_TELEA
+                )
+                background = Image.fromarray(background)
+        else:
+            background = tensor2pil(bg_image)[0]
+        
+        # Create batch of images with cut region at different positions
+        for i in range(batch_size):
+            # Create new image
+            new_image = background.copy()
+            new_mask = Image.new("L", (frame_width, frame_height), 0)
+
+            # Get target position from coordinates
+            for coords in coords_list:
+                target_x = int(coords[i]['x'] - cut_width/2)
+                target_y = int(coords[i]['y'] - cut_height/2)
+
+                # Paste cut region at new position
+                new_image.paste(cut_image, (target_x, target_y), cut_mask)
+                new_mask.paste(cut_mask, (target_x, target_y))
+
+            # Convert to tensor and append
+            image_tensor = pil2tensor(new_image)
+            mask_tensor = pil2tensor(new_mask)
+            
+            images_list.append(image_tensor)
+            masks_list.append(mask_tensor)
+
+        # Stack tensors into batches
+        out_images = torch.cat(images_list, dim=0).cpu().float()
+        out_masks = torch.cat(masks_list, dim=0)
+
+        return (out_images, out_masks)

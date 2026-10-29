@@ -1,4 +1,4 @@
-from ..utility.utility import tensor2pil, pil2tensor
+from ..utility.utility import tensor2pil, pil2tensor, normalize_bboxes, BBOX_TYPES
 from PIL import Image, ImageDraw, ImageFilter
 import numpy as np
 import torch
@@ -161,7 +161,7 @@ class BatchUncrop:
             "required": {
                 "original_images": ("IMAGE",),
                 "cropped_images": ("IMAGE",),
-                "bboxes": ("BBOX",),
+                "bboxes": (BBOX_TYPES,),
                 "border_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}, ),
                 "crop_rescale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "border_top": ("BOOLEAN", {"default": True}),
@@ -192,6 +192,8 @@ class BatchUncrop:
 
         if len(original_images) != len(cropped_images):
             raise ValueError(f"The number of original_images ({len(original_images)}) and cropped_images ({len(cropped_images)}) should be the same")
+
+        bboxes = normalize_bboxes(bboxes)
 
         # Ensure there are enough bboxes, but drop the excess if there are more bboxes than images
         if len(bboxes) > len(original_images):
@@ -542,14 +544,14 @@ class BatchUncropAdvanced:
                 "cropped_images": ("IMAGE",), 
                 "cropped_masks": ("MASK",),
                 "combined_crop_mask": ("MASK",),
-                "bboxes": ("BBOX",),
+                "bboxes": (BBOX_TYPES,),
                 "border_blending": ("FLOAT", {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01}, ),
                 "crop_rescale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "use_combined_mask": ("BOOLEAN", {"default": False}),
                 "use_square_mask": ("BOOLEAN", {"default": True}),
             },
             "optional": {
-                "combined_bounding_box": ("BBOX", {"default": None}),  
+                "combined_bounding_box": (BBOX_TYPES, {"default": None}),
             },
         }
 
@@ -570,6 +572,10 @@ class BatchUncropAdvanced:
 
         if len(original_images) != len(cropped_images):
             raise ValueError(f"The number of original_images ({len(original_images)}) and cropped_images ({len(cropped_images)}) should be the same")
+
+        bboxes = normalize_bboxes(bboxes)
+        if combined_bounding_box is not None:
+            combined_bounding_box = normalize_bboxes(combined_bounding_box)
 
         # Ensure there are enough bboxes, but drop the excess if there are more bboxes than images
         if len(bboxes) > len(original_images):
@@ -641,7 +647,7 @@ class SplitBboxes:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "bboxes": ("BBOX",),
+                "bboxes": (BBOX_TYPES,),
                 "index": ("INT", {"default": 0,"min": 0, "max": 99999999, "step": 1}),
             },
         }
@@ -655,6 +661,7 @@ Splits the specified bbox list at the given index into two lists.
 """
 
     def splitbbox(self, bboxes, index):
+        bboxes = normalize_bboxes(bboxes)
         bboxes_a = bboxes[:index]  # Sub-list from the start of bboxes up to (but not including) the index
         bboxes_b = bboxes[index:]  # Sub-list from the index to the end of bboxes
 
@@ -666,7 +673,7 @@ class BboxToInt:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "bboxes": ("BBOX",),
+                "bboxes": (BBOX_TYPES,),
                 "index": ("INT", {"default": 0,"min": 0, "max": 99999999, "step": 1}),
             },
         }
@@ -679,7 +686,7 @@ class BboxToInt:
 Returns selected index from bounding box list as integers.
 """
     def bboxtoint(self, bboxes, index):
-        x_min, y_min, width, height = bboxes[index]
+        x_min, y_min, width, height = normalize_bboxes(bboxes)[index]
         center_x = int(x_min + width / 2)
         center_y = int(y_min + height / 2)
         
@@ -692,8 +699,9 @@ class BboxVisualize:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "bboxes": ("BBOX",),
+                "bboxes": (BBOX_TYPES,),
                 "line_width": ("INT", {"default": 1,"min": 1, "max": 10, "step": 1}),
+                "bbox_format": (["xywh", "xyxy"], {"default": "xywh"}),
             },
         }
 
@@ -706,31 +714,61 @@ Visualizes the specified bbox on the image.
 
     CATEGORY = "KJNodes/masking"
 
-    def visualizebbox(self, bboxes, images, line_width):
+    def visualizebbox(self, bboxes, images, line_width, bbox_format):
         image_list = []
-        for image, bbox in zip(images, bboxes):
-            x_min, y_min, width, height = bbox
+        for image, bbox in zip(images, normalize_bboxes(bboxes, bbox_format)):
+            # Ensure bbox is a sequence of 4 values
+            if isinstance(bbox, (list, tuple, np.ndarray)) and len(bbox) == 4:
+                if bbox_format == "xywh":
+                    x_min, y_min, width, height = bbox
+                elif bbox_format == "xyxy":
+                    x_min, y_min, x_max, y_max = bbox
+                    width = x_max - x_min
+                    height = y_max - y_min
+                else:
+                    raise ValueError(f"Unknown bbox_format: {bbox_format}")
+            else:
+                print("Invalid bbox:", bbox)
+                continue
+
+            # Ensure bbox coordinates are integers
+            x_min = int(x_min)
+            y_min = int(y_min)
+            width = int(width)
+            height = int(height)
+
+            # Permute the image dimensions
             image = image.permute(2, 0, 1)
 
+            # Clone the image to draw bounding boxes
             img_with_bbox = image.clone()
-            
+
             # Define the color for the bbox, e.g., red
             color = torch.tensor([1, 0, 0], dtype=torch.float32)
-            
+
+            # Ensure color tensor matches the image channels
+            if color.shape[0] != img_with_bbox.shape[0]:
+                color = color.unsqueeze(1).expand(-1, line_width)
+
             # Draw lines for each side of the bbox with the specified line width
             for lw in range(line_width):
                 # Top horizontal line
-                img_with_bbox[:, y_min + lw, x_min:x_min + width] = color[:, None]
-                
+                if y_min + lw < img_with_bbox.shape[1]:
+                    img_with_bbox[:, y_min + lw, x_min:x_min + width] = color[:, None]
+
                 # Bottom horizontal line
-                img_with_bbox[:, y_min + height - lw, x_min:x_min + width] = color[:, None]
-                
+                if y_min + height - lw < img_with_bbox.shape[1]:
+                    img_with_bbox[:, y_min + height - lw, x_min:x_min + width] = color[:, None]
+
                 # Left vertical line
-                img_with_bbox[:, y_min:y_min + height, x_min + lw] = color[:, None]
-                
+                if x_min + lw < img_with_bbox.shape[2]:
+                    img_with_bbox[:, y_min:y_min + height, x_min + lw] = color[:, None]
+
                 # Right vertical line
-                img_with_bbox[:, y_min:y_min + height, x_min + width - lw] = color[:, None]
-        
+                if x_min + width - lw < img_with_bbox.shape[2]:
+                    img_with_bbox[:, y_min:y_min + height, x_min + width - lw] = color[:, None]
+
+            # Permute the image dimensions back
             img_with_bbox = img_with_bbox.permute(1, 2, 0).unsqueeze(0)
             image_list.append(img_with_bbox)
 
